@@ -348,7 +348,8 @@ const server = http.createServer(async (req, res) => {
     }
     return send(res, 404, { err: 'not found' });
   } catch (err) {
-    console.log('[' + site.cfg.key + ']', req.url, '->', err && err.message ? err.message : err);
+    console.log('[' + site.cfg.key + ']', req.url, '->', err && err.message ? err.message : err,
+      err && err.cause ? '| cause: ' + (err.cause.code || err.cause.message) : '');
     if (resource === 'catalog') return send(res, 200, { metas: [] });
     if (resource === 'meta') return send(res, 200, { meta: null });
     if (resource === 'stream') return send(res, 200, { streams: [] });
