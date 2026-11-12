@@ -307,6 +307,120 @@ const dec = (s) => {
   try { return decodeURIComponent(s); } catch (e) { return s; }
 };
 
+// ------------------------------------------------- TEMP: opensubtitles.org diagnostics
+// Temporary test routes (remove after the test). They only accept an IMDb id + season + episode
+// and only talk to rest.opensubtitles.org / api.ipify.org, so they are not an open proxy.
+//   /_ip
+//   /_orgtest?id=tt0988824&s=1&e=2            (both agents, episode URL + fallback URL, node https)
+//   /_orgtest?id=tt0988824&s=1&e=2&client=fetch   (same but with Node's built-in fetch)
+const https = require('https');
+const zlib = require('zlib');
+const ORG_AGENTS = ['TemporaryUserAgent', 'VLSub 0.10.3'];
+let orgTestHits = [];
+
+function httpsGetRaw(url, headers, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let done = false;
+    const finish = (o) => { if (!done) { done = true; resolve({ ms: Date.now() - t0, ...o }); } };
+    const req = https.get(url, { headers }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => {
+        let buf = Buffer.concat(chunks);
+        try {
+          const enc = String(r.headers['content-encoding'] || '').toLowerCase();
+          if (enc === 'gzip') buf = zlib.gunzipSync(buf);
+          else if (enc === 'br') buf = zlib.brotliDecompressSync(buf);
+          else if (enc === 'deflate') buf = zlib.inflateSync(buf);
+        } catch (e) { /* keep raw */ }
+        finish({ status: r.statusCode, headers: r.headers, body: buf.toString('utf8') });
+      });
+      r.on('error', (e) => finish({ error: e.message }));
+    });
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('timeout')); });
+    req.on('error', (e) => finish({ error: e.message }));
+  });
+}
+
+async function fetchRaw(url, headers, timeoutMs) {
+  const t0 = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { headers, signal: ctrl.signal });
+    const body = await r.text();
+    const h = {};
+    r.headers.forEach((v, k) => { h[k] = v; });
+    return { ms: Date.now() - t0, status: r.status, headers: h, body };
+  } catch (e) {
+    return { ms: Date.now() - t0, error: e.message + (e.cause ? ' | ' + (e.cause.code || e.cause.message) : '') };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function orgOne(client, url, ua) {
+  // same headers as the main addon's axios call
+  const headers = { 'User-Agent': ua, 'X-User-Agent': ua, Accept: 'application/json', 'Accept-Encoding': 'gzip, compress, deflate, br' };
+  const r = client === 'fetch' ? await fetchRaw(url, headers, 8000) : await httpsGetRaw(url, headers, 8000);
+  const out = { agent: ua, url, ms: r.ms };
+  if (r.error) { out.error = r.error; return out; }
+  out.status = r.status;
+  const h = r.headers || {};
+  out.server = h.server || '';
+  out.cfRay = h['cf-ray'] || '';
+  out.contentType = h['content-type'] || '';
+  if (r.status >= 200 && r.status < 300) {
+    try {
+      const j = JSON.parse(r.body);
+      out.count = Array.isArray(j) ? j.length : -1;
+      out.ass = Array.isArray(j) ? j.filter((x) => /^(ass|ssa)$/i.test(String(x.SubFormat || ''))).length : 0;
+    } catch (e) { out.count = -1; out.parseError = true; }
+  } else {
+    out.bodyHead = String(r.body || '').replace(/\s+/g, ' ').slice(0, 300);
+  }
+  return out;
+}
+
+async function handleDiag(req, res, pathname) {
+  const now = Date.now();
+  orgTestHits = orgTestHits.filter((t) => now - t < 3600000);
+  if (orgTestHits.length >= 120) return send(res, 429, { err: 'too many test requests, try later' });
+  orgTestHits.push(now);
+
+  const q = new URL(req.url, 'http://localhost').searchParams;
+  if (pathname === '/_ip') {
+    const r = await httpsGetRaw('https://api.ipify.org?format=json', { 'User-Agent': 'node' }, 6000);
+    let ip = '';
+    try { ip = JSON.parse(r.body).ip; } catch (e) { /* ignore */ }
+    return send(res, 200, { ip, error: r.error || undefined, nodeVersion: process.version, time: new Date().toISOString() });
+  }
+  const id = String(q.get('id') || '');
+  const season = q.get('s');
+  const episode = q.get('e');
+  if (!/^tt\d{1,10}$/.test(id)) return send(res, 400, { err: 'id must look like tt0988824' });
+  const hasSE = season !== null && episode !== null;
+  if (hasSE && !(/^\d{1,4}$/.test(season) && /^\d{1,4}$/.test(episode))) return send(res, 400, { err: 's and e must be numbers' });
+  const client = q.get('client') === 'fetch' ? 'fetch' : 'https';
+  const lang = /^[a-z]{3}$/.test(String(q.get('lang') || '')) ? q.get('lang') : 'ara';
+  const numeric = id.replace(/^tt0*/, '');
+  const urls = [];
+  if (hasSE) urls.push('https://rest.opensubtitles.org/search/episode-' + episode + '/imdbid-' + numeric + '/season-' + season + '/sublanguageid-' + lang);
+  urls.push('https://rest.opensubtitles.org/search/imdbid-' + numeric + '/sublanguageid-' + lang);
+  const attempts = [];
+  for (const u of urls) for (const ua of ORG_AGENTS) attempts.push(await orgOne(client, u, ua));
+  const ok = attempts.filter((a) => a.status >= 200 && a.status < 300).length;
+  const blocked = attempts.filter((a) => a.status === 403 || a.status === 401).length;
+  const ipr = await httpsGetRaw('https://api.ipify.org?format=json', { 'User-Agent': 'node' }, 4000);
+  let ip = '';
+  try { ip = JSON.parse(ipr.body).ip; } catch (e) { /* ignore */ }
+  return send(res, 200, {
+    summary: ok + ' ok / ' + blocked + ' blocked(401/403) / ' + attempts.length + ' total',
+    client, id, season, episode, lang, ip, time: new Date().toISOString(), attempts,
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -315,6 +429,11 @@ const server = http.createServer(async (req, res) => {
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
     });
     return res.end();
+  }
+
+  const pathname0 = new URL(req.url, 'http://localhost').pathname;
+  if (pathname0 === '/_ip' || pathname0 === '/_orgtest') {
+    try { return await handleDiag(req, res, pathname0); } catch (e) { return send(res, 500, { err: String(e && e.message || e) }); }
   }
 
   let parts = new URL(req.url, 'http://localhost').pathname.split('/').filter(Boolean);
