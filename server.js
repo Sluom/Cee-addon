@@ -421,6 +421,119 @@ async function handleDiag(req, res, pathname) {
   });
 }
 
+// ---- TEMP: opensubtitles.org XML-RPC login test (/_orgrpc?id=tt0988824&s=1&e=2)
+// Credentials come from Render env vars ORG_USER / ORG_PASS (never hardcode, never printed).
+// Optional: ORG_RPC_UA = a registered user agent. ORG_RPC_URL is only for local testing.
+const ORG_RPC_URL = process.env.ORG_RPC_URL || 'https://api.opensubtitles.org/xml-rpc';
+const xmlEsc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const xStr = (v) => '<value><string>' + xmlEsc(v) + '</string></value>';
+
+function httpsPostRaw(url, body, headers, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let done = false;
+    const finish = (o) => { if (!done) { done = true; resolve({ ms: Date.now() - t0, ...o }); } };
+    const u = new URL(url);
+    const mod = u.protocol === 'http:' ? require('http') : https;
+    const req = mod.request(u, { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(body) } }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => {
+        let buf = Buffer.concat(chunks);
+        try {
+          const enc = String(r.headers['content-encoding'] || '').toLowerCase();
+          if (enc === 'gzip') buf = zlib.gunzipSync(buf);
+          else if (enc === 'br') buf = zlib.brotliDecompressSync(buf);
+          else if (enc === 'deflate') buf = zlib.inflateSync(buf);
+        } catch (e) { /* keep raw */ }
+        finish({ status: r.statusCode, headers: r.headers, body: buf.toString('utf8') });
+      });
+      r.on('error', (e) => finish({ error: e.message }));
+    });
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('timeout')); });
+    req.on('error', (e) => finish({ error: e.message }));
+    req.write(body);
+    req.end();
+  });
+}
+
+function rpcCall(method, paramsXml, ua) {
+  const body = '<?xml version="1.0"?><methodCall><methodName>' + method + '</methodName><params>' + paramsXml + '</params></methodCall>';
+  return httpsPostRaw(ORG_RPC_URL, body, { 'Content-Type': 'text/xml', 'User-Agent': ua, Accept: '*/*' }, 9000);
+}
+
+// tiny extractors (no full XML parser needed for this test)
+const xmlField = (xml, name) => {
+  const m = new RegExp('<name>' + name + '</name>\\s*<value>\\s*(?:<string>)?([^<]*)', 'i').exec(xml);
+  return m ? m[1].trim() : '';
+};
+const xmlCount = (xml, name) => (xml.match(new RegExp('<name>' + name + '</name>', 'gi')) || []).length;
+
+function rpcSummary(r) {
+  const o = { ms: r.ms };
+  if (r.error) { o.error = r.error; return o; }
+  o.httpStatus = r.status;
+  o.server = (r.headers && r.headers.server) || '';
+  o.cfRay = (r.headers && r.headers['cf-ray']) || '';
+  o.contentType = (r.headers && r.headers['content-type']) || '';
+  return o;
+}
+
+async function orgRpcTry(label, user, pass, ua, id, season, episode, lang) {
+  const out = { mode: label, userAgent: ua };
+  const login = await rpcCall('LogIn', '<param>' + xStr(user) + '</param><param>' + xStr(pass) + '</param><param>' + xStr('en') + '</param><param>' + xStr(ua) + '</param>', ua);
+  out.login = rpcSummary(login);
+  if (login.error) return out;
+  const isXml = /<methodResponse/i.test(login.body || '');
+  out.login.isXmlRpc = isXml;
+  if (!isXml) { out.login.bodyHead = String(login.body || '').replace(/\s+/g, ' ').slice(0, 300); return out; }
+  out.login.rpcStatus = xmlField(login.body, 'status');
+  const token = xmlField(login.body, 'token');
+  out.login.gotToken = !!token;
+  if (!token) return out;
+  const numeric = id.replace(/^tt0*/, '');
+  const q = '<value><struct>'
+    + '<member><name>sublanguageid</name>' + xStr(lang) + '</member>'
+    + '<member><name>imdbid</name>' + xStr(numeric) + '</member>'
+    + (season !== null && episode !== null ? '<member><name>season</name>' + xStr(season) + '</member><member><name>episode</name>' + xStr(episode) + '</member>' : '')
+    + '</struct></value>';
+  const sr = await rpcCall('SearchSubtitles', '<param>' + xStr(token) + '</param><param><value><array><data>' + q + '</data></array></value></param>', ua);
+  out.search = rpcSummary(sr);
+  if (sr.error) return out;
+  if (!/<methodResponse/i.test(sr.body || '')) { out.search.bodyHead = String(sr.body || '').replace(/\s+/g, ' ').slice(0, 300); return out; }
+  out.search.rpcStatus = xmlField(sr.body, 'status');
+  out.search.results = xmlCount(sr.body, 'IDSubtitleFile');
+  out.search.ass = (sr.body.match(/<name>SubFormat<\/name>\s*<value>\s*(?:<string>)?\s*(ass|ssa)\b/gi) || []).length;
+  out.search.srt = (sr.body.match(/<name>SubFormat<\/name>\s*<value>\s*(?:<string>)?\s*srt\b/gi) || []).length;
+  rpcCall('LogOut', '<param>' + xStr(token) + '</param>', ua).catch(() => {});
+  return out;
+}
+
+async function handleOrgRpc(req, res) {
+  const now = Date.now();
+  orgTestHits = orgTestHits.filter((t) => now - t < 3600000);
+  if (orgTestHits.length >= 120) return send(res, 429, { err: 'too many test requests, try later' });
+  orgTestHits.push(now);
+  const q = new URL(req.url, 'http://localhost').searchParams;
+  const id = String(q.get('id') || '');
+  const season = q.get('s');
+  const episode = q.get('e');
+  if (!/^tt\d{1,10}$/.test(id)) return send(res, 400, { err: 'id must look like tt0988824' });
+  const hasSE = season !== null && episode !== null;
+  if (hasSE && !(/^\d{1,4}$/.test(season) && /^\d{1,4}$/.test(episode))) return send(res, 400, { err: 's and e must be numbers' });
+  const lang = /^[a-z]{3}$/.test(String(q.get('lang') || '')) ? q.get('lang') : 'ara';
+  const ua = process.env.ORG_RPC_UA || 'TemporaryUserAgent';
+  const user = process.env.ORG_USER || '';
+  const pass = process.env.ORG_PASS || '';
+  const attempts = [];
+  attempts.push(await orgRpcTry('anonymous', '', '', ua, id, hasSE ? season : null, hasSE ? episode : null, lang));
+  if (user && pass) attempts.push(await orgRpcTry('account', user, pass, ua, id, hasSE ? season : null, hasSE ? episode : null, lang));
+  const ipr = await httpsGetRaw('https://api.ipify.org?format=json', { 'User-Agent': 'node' }, 4000);
+  let ip = '';
+  try { ip = JSON.parse(ipr.body).ip; } catch (e) { /* ignore */ }
+  return send(res, 200, { id, season, episode, lang, accountConfigured: !!(user && pass), ip, time: new Date().toISOString(), attempts });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -432,6 +545,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   const pathname0 = new URL(req.url, 'http://localhost').pathname;
+  if (pathname0 === '/_orgrpc') {
+    try { return await handleOrgRpc(req, res); } catch (e) { return send(res, 500, { err: String(e && e.message || e) }); }
+  }
   if (pathname0 === '/_ip' || pathname0 === '/_orgtest') {
     try { return await handleDiag(req, res, pathname0); } catch (e) { return send(res, 500, { err: String(e && e.message || e) }); }
   }
